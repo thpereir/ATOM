@@ -182,5 +182,63 @@ class TestMxfp4NoBiasCreated(unittest.TestCase):
         self.assertIsInstance(registered["w2_bias"], torch.nn.Parameter)
 
 
+
+
+class TestSwiGLUInterleavingWithoutBias(unittest.TestCase):
+    """SwiGLU weight interleaving must happen regardless of has_bias.
+
+    Root cause:
+      process_weights_after_loading guarded the SwiGLU interleaving branch
+      on ``layer.w13_bias is not None``.  When has_bias=False (no bias),
+      it fell through to the generic 'else' branch that uses different
+      shuffling functions (shuffle_weights + e8m0_shuffle) which do NOT
+      interleave gate/up weights.  The a16w4 kernel still expects
+      interleaved weights -> garbage output.
+
+    Fix:
+      Change condition from
+        ``layer.activation == ActivationType.Swiglu and layer.w13_bias is not None``
+      to
+        ``layer.activation == ActivationType.Swiglu``
+      and guard only the bias interleaving on ``layer.w13_bias is not None``.
+    """
+
+    def test_swiglu_branch_condition_no_bias_check(self):
+        """The SwiGLU branch must NOT require bias to be present."""
+        import inspect
+        from atom.model_ops.moe import Mxfp4MoEMethod
+
+        source = inspect.getsource(Mxfp4MoEMethod.process_weights_after_loading)
+
+        # The condition should be just ActivationType.Swiglu, without "and ... bias"
+        self.assertIn(
+            "layer.activation == ActivationType.Swiglu:",
+            source.replace("\n", ""),
+            "SwiGLU branch must trigger on activation type alone, "
+            "not conditionally on bias presence",
+        )
+
+        # Bias interleaving should be guarded separately
+        self.assertIn(
+            "if layer.w13_bias is not None:",
+            source,
+            "Bias interleaving should be a separate conditional inside "
+            "the SwiGLU branch",
+        )
+
+    def test_swiglu_branch_does_not_couple_bias_and_shuffle(self):
+        """Ensure the old coupled condition is gone."""
+        import inspect
+        from atom.model_ops.moe import Mxfp4MoEMethod
+
+        source = inspect.getsource(Mxfp4MoEMethod.process_weights_after_loading)
+
+        self.assertNotIn(
+            "Swiglu and layer.w13_bias is not None",
+            source,
+            "Old coupled condition (Swiglu AND bias) must be removed",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

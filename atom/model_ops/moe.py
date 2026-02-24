@@ -780,7 +780,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = None
             layer.w2_weight_scale = None
             return
-        elif layer.activation == ActivationType.Swiglu and layer.w13_bias is not None:
+        elif layer.activation == ActivationType.Swiglu:
             e, n, k = layer.w13_weight.shape
             layer.w13_weight.view(torch.uint8).copy_(
                 layer.w13_weight.data.view(torch.uint8)
@@ -807,12 +807,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.num_experts,
                 False,
             )
-            layer.w13_bias.data = (
-                layer.w13_bias.data.view(-1, n // 2, 2)
-                .permute(0, 2, 1)
-                .contiguous()
-                .view(-1, n)
-            )
+            if layer.w13_bias is not None:
+                layer.w13_bias.data = (
+                    layer.w13_bias.data.view(-1, n // 2, 2)
+                    .permute(0, 2, 1)
+                    .contiguous()
+                    .view(-1, n)
+                )
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
             shuffle_weights(layer.w13_weight, layer.w2_weight)
