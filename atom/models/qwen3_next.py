@@ -170,6 +170,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             use_grouped_topk=False,
             prefix=f"{prefix}.experts",
+            has_bias=False,
             config=config,
         )
 
