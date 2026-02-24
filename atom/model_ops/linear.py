@@ -551,6 +551,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         source_quant_dtype: torch.dtype = None,
+        prefix: str = "",
         **kwargs,
     ):
         self.head_size = head_size
@@ -575,6 +576,9 @@ class QKVParallelLinear(ColumnParallelLinear):
             self.num_kv_heads * self.head_size * tp_size,
             self.num_kv_heads * self.head_size * tp_size,
         ]
+
+        if quant_config is not None and prefix:
+            quant_config = get_quant_config_for_layer(quant_config, prefix)
 
         super().__init__(
             input_size,
