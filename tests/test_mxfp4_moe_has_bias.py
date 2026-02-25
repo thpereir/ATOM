@@ -240,5 +240,25 @@ class TestSwiGLUInterleavingWithoutBias(unittest.TestCase):
         )
 
 
+
+class TestQwen3MoeQKNormShape(unittest.TestCase):
+    """Qwen3MoeAttention must apply q/k norm per-head, not on flattened vectors."""
+
+    def test_qk_norm_is_per_head(self):
+        import inspect
+        from atom.models.qwen3_moe import Qwen3MoeAttention
+
+        source = inspect.getsource(Qwen3MoeAttention.forward)
+        self.assertIn(
+            "self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view",
+            source,
+            "q_norm must reshape q to [tokens, num_heads, head_dim] before RMSNorm",
+        )
+        self.assertIn(
+            "self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view",
+            source,
+            "k_norm must reshape k to [tokens, num_kv_heads, head_dim] before RMSNorm",
+        )
+
 if __name__ == "__main__":
     unittest.main()

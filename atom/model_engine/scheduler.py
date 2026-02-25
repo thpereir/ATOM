@@ -232,7 +232,10 @@ class Scheduler:
         num_scheduled_tokens_np = num_scheduled_tokens
         total_tokens_num_decode = sum(num_scheduled_tokens_np)
 
-        assert scheduled_seqs
+        if not scheduled_seqs:
+            # Could not schedule any decode step (likely OOM or fragmentation)
+            return None
+
         self.running.extendleft(reversed(scheduled_seqs.values()))
         # logger.info(
         #     f"Scheduled decode batch: {num_seqs_decode} reqs, {total_tokens_num_decode} tokens, req_ids: {tuple(scheduled_seqs.keys())}"

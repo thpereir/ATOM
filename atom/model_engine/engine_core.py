@@ -161,9 +161,12 @@ class EngineCore:
     def _process_engine_step(self):
         if not self.scheduler.has_requests():
             return False
-        scheduled_batch, seqs = self.scheduler.schedule()
-        # if scheduled_batch is None:
-        #     return False
+        
+        schedule_result = self.scheduler.schedule()
+        if schedule_result is None:
+            return False
+            
+        scheduled_batch, seqs = schedule_result
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         seqs = seqs.values()
         # Pass stream_output_queue to postprocess for streaming callbacks
