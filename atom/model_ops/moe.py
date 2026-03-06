@@ -1948,6 +1948,28 @@ class FusedMoE(torch.nn.Module):
 
         if quant_config is not None and prefix:
             quant_config = get_quant_config_for_layer(quant_config, prefix)
+        if quant_config is None:
+            quant_config = QuantizationConfig()
+
+        # Resolve per-layer quant spec so the dispatch below sees the
+        # correct dtype/type when per-layer overrides differ from the
+        # global config (e.g., MXFP4 globally but FP8 for MTP layers).
+        if hasattr(quant_config, "resolve") and prefix:
+            _spec = quant_config.resolve(prefix)
+            if _spec.is_quantized and (
+                _spec.quant_dtype != quant_config["quant_dtype"]
+                or _spec.quant_type != quant_config["quant_type"]
+            ):
+                quant_config = QuantizationConfig(
+                    quant_type=_spec.quant_type,
+                    quant_dtype=_spec.quant_dtype,
+                    is_dynamic=quant_config.get("is_dynamic", True),
+                    quant_name=quant_config.get("quant_name", ""),
+                    quant_method=quant_config.get("quant_method", None),
+                )
+        # Update instance attrs to match the (possibly resolved) config
+        self.quant_config = quant_config
+        self.params_dtype = quant_config["quant_dtype"]
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
