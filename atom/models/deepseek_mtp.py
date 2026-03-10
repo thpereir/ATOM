@@ -56,8 +56,8 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         )
 
         quant_config = atom_config.quant_config
-        layer_quant_config = quant_config.get_layer_quant_config(prefix)
-        if layer_quant_config["quant_dtype"] == dtypes.fp4x2:
+        layer_quant_spec = quant_config.get_layer_quant_spec(prefix)
+        if layer_quant_spec.quant_dtype == dtypes.fp4x2:
             quant_config = QuantizationConfig()
 
         self.mtp_block = DeepseekV2DecoderLayer(

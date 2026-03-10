@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
-# Tests for LayerQuantConfig and QuantizationConfig refactoring (atom/config.py).
+# Tests for LayerQuantConfig, LayerQuantSpec, QuantizationConfig, and the
+# parser registry (atom/config.py + atom/quant_spec.py).
 #
 # Covers: per-layer quant config dispatch, quark config parsing,
-# layer name matching (exact / regex / fnmatch), and packed-module remapping.
+# layer name matching (exact / regex / fnmatch), packed-module remapping,
+# typed LayerQuantSpec API, and backward compatibility.
 #
 # atom.config depends on torch, aiter, and transformers.  We load the source
-# file under temporary sys.modules mocks so the tests run in any environment.
+# files under temporary sys.modules mocks so the tests run in any environment.
 
 import contextlib
 import enum
@@ -20,9 +22,9 @@ import pytest
 
 ATOM_ROOT = str(Path(__file__).resolve().parent.parent)
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Mock primitives
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 
 class QuantType(enum.IntEnum):
@@ -60,9 +62,9 @@ class FakeHFConfig:
         return {}, {}
 
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Module loader — patch sys.modules only while exec-ing config.py
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 
 @contextlib.contextmanager
@@ -123,22 +125,35 @@ def _temporary_mocks():
                 sys.modules[name] = orig
 
 
-def _load_config():
-    path = os.path.join(ATOM_ROOT, "atom", "config.py")
-    spec = importlib.util.spec_from_file_location("_atom_config_test", path)
+def _load_module(filename: str, module_name: str):
+    path = os.path.join(ATOM_ROOT, "atom", filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     mod = importlib.util.module_from_spec(spec)
+    # Register before exec so @dataclass etc. can resolve the module
+    sys.modules[module_name] = mod
     with _temporary_mocks():
         spec.loader.exec_module(mod)
     return mod
 
 
-_m = _load_config()
+# Load quant_spec first, then inject it so config.py can import it.
+_qs = _load_module("quant_spec.py", "atom.quant_spec")
+sys.modules["atom.quant_spec"] = _qs
+
+_m = _load_module("config.py", "_atom_config_test")
+
 LayerQuantConfig = _m.LayerQuantConfig
 QuantizationConfig = _m.QuantizationConfig
+LayerQuantSpec = _qs.LayerQuantSpec
+ParsedQuantConfig = _qs.ParsedQuantConfig
+QuarkParser = _qs.QuarkParser
+GenericParser = _qs.GenericParser
+get_quant_parser = _qs.get_quant_parser
 
-# ===========================================================================
-# Tests
-# ===========================================================================
+
+# =========================================================================
+# Tests — LayerQuantConfig (backward-compat dict API)
+# =========================================================================
 
 
 class TestLayerQuantConfig:
@@ -161,21 +176,161 @@ class TestLayerQuantConfig:
         assert cfg["quant_dtype"] == FP8
         assert cfg["is_dynamic"] is False
 
+    def test_to_spec(self):
+        cfg = LayerQuantConfig(
+            quant_type=QuantType.per_Token,
+            quant_dtype=FP8,
+            is_dynamic=False,
+            quant_method="quark",
+        )
+        spec = cfg.to_spec()
+        assert isinstance(spec, LayerQuantSpec)
+        assert spec.quant_type == QuantType.per_Token
+        assert spec.quant_dtype == FP8
+        assert spec.is_dynamic is False
+        assert spec.quant_method == "quark"
+
+
+# =========================================================================
+# Tests — LayerQuantSpec
+# =========================================================================
+
+
+class TestLayerQuantSpec:
+    def test_defaults(self):
+        spec = LayerQuantSpec()
+        assert spec.quant_type == QuantType.No
+        assert spec.quant_dtype == BF16
+        assert spec.is_dynamic is True
+        assert spec.quant_method is None
+        assert spec.is_quantized is False
+
+    def test_no_quant_factory(self):
+        spec = LayerQuantSpec.no_quant(FP8)
+        assert spec.quant_type == QuantType.No
+        assert spec.quant_dtype == FP8
+        assert spec.is_quantized is False
+
+    def test_is_quantized(self):
+        spec = LayerQuantSpec(quant_type=QuantType.per_Token, quant_dtype=FP8)
+        assert spec.is_quantized is True
+
+    def test_frozen(self):
+        spec = LayerQuantSpec()
+        with pytest.raises(AttributeError):
+            spec.quant_type = QuantType.per_Token  # type: ignore[misc]
+
+
+# =========================================================================
+# Tests — Parser Registry
+# =========================================================================
+
+
+class TestParserRegistry:
+    def test_quark_registered(self):
+        parser = get_quant_parser("quark")
+        assert isinstance(parser, QuarkParser)
+
+    def test_generic_fallback(self):
+        parser = get_quant_parser("compressed-tensors")
+        assert isinstance(parser, GenericParser)
+
+    def test_unknown_falls_to_generic(self):
+        parser = get_quant_parser("some_unknown_method")
+        assert isinstance(parser, GenericParser)
+
+
+# =========================================================================
+# Tests — QuarkParser
+# =========================================================================
+
+
+class TestQuarkParser:
+    def test_per_channel_fp8(self):
+        parser = QuarkParser()
+        result = parser.parse({
+            "quant_method": "quark",
+            "global_quant_config": {
+                "weight": {"qscheme": "per_channel", "dtype": "fp8_e4m3"},
+                "input_tensors": {"is_dynamic": True},
+            },
+        })
+        assert result.global_spec.quant_type == QuantType.per_Token
+        assert result.global_spec.quant_dtype == FP8
+        assert result.global_spec.is_dynamic is True
+
+    def test_per_group_fp4(self):
+        parser = QuarkParser()
+        result = parser.parse({
+            "quant_method": "quark",
+            "global_quant_config": {
+                "weight": {"qscheme": "per_group", "dtype": "fp4_e2m1"},
+                "input_tensors": {"is_dynamic": False},
+            },
+        })
+        assert result.global_spec.quant_type == QuantType.per_1x32
+        assert result.global_spec.quant_dtype == FP4X2
+        assert result.global_spec.is_dynamic is False
+
+    def test_no_input_tensors_defaults_dynamic(self):
+        parser = QuarkParser()
+        result = parser.parse({
+            "quant_method": "quark",
+            "global_quant_config": {
+                "weight": {"qscheme": "per_tensor", "dtype": "int8"},
+                "input_tensors": None,
+            },
+        })
+        assert result.global_spec.quant_type == QuantType.per_Tensor
+        assert result.global_spec.is_dynamic is True
+
+    def test_layer_config_parsed(self):
+        parser = QuarkParser()
+        result = parser.parse({
+            "quant_method": "quark",
+            "global_quant_config": {
+                "weight": {"qscheme": "per_channel", "dtype": "fp8_e4m3"},
+                "input_tensors": {"is_dynamic": True},
+            },
+            "layer_quant_config": {
+                "*.mlp.*": {
+                    "weight": {"qscheme": "per_group", "dtype": "fp4_e2m1"},
+                    "input_tensors": {"is_dynamic": False},
+                },
+            },
+            "exclude": ["lm_head"],
+        })
+        assert len(result.layer_pattern_specs) == 1
+        pattern, spec = result.layer_pattern_specs[0]
+        assert pattern == "*.mlp.*"
+        assert spec.quant_type == QuantType.per_1x32
+        assert spec.quant_dtype == FP4X2
+        assert result.exclude_layers == ["lm_head"]
+
+
+# =========================================================================
+# Tests — QuantizationConfig init
+# =========================================================================
+
 
 class TestQuantizationConfigInit:
     def test_none_config(self):
         qcfg = QuantizationConfig(config=None)
         assert qcfg.quant_method == ""
         assert qcfg.exclude_layers == []
+        # backward-compat dict API still works
         assert qcfg.layer_quant_config == {}
         assert qcfg.global_quant_config["quant_type"] == QuantType.No
+        # new typed API
+        assert qcfg.global_quant_spec.quant_type == QuantType.No
+        assert qcfg.global_quant_spec.is_quantized is False
 
     def test_config_without_quantization(self):
         hf = FakeHFConfig(torch_dtype=BF16)
         qcfg = QuantizationConfig(hf)
         assert qcfg.quant_method == ""
-        assert qcfg.global_quant_config["quant_type"] == QuantType.No
-        assert qcfg.global_quant_config["quant_dtype"] == BF16
+        assert qcfg.global_quant_spec.quant_type == QuantType.No
+        assert qcfg.global_quant_spec.quant_dtype == BF16
 
     def test_quark_config_parses_global_and_layer(self):
         hf = FakeHFConfig(
@@ -197,9 +352,13 @@ class TestQuantizationConfigInit:
         )
         qcfg = QuantizationConfig(hf)
         assert qcfg.quant_method == "quark"
+        # typed API
+        assert qcfg.global_quant_spec.quant_type == QuantType.per_Token
+        assert qcfg.global_quant_spec.quant_dtype == FP8
+        # backward-compat dict API
         assert qcfg.global_quant_config["quant_type"] == QuantType.per_Token
         assert qcfg.global_quant_config["quant_dtype"] == FP8
-
+        # layer configs
         assert "*.mlp.*" in qcfg.layer_quant_config
         mlp = qcfg.layer_quant_config["*.mlp.*"]
         assert mlp["quant_type"] == QuantType.per_1x32
@@ -209,113 +368,47 @@ class TestQuantizationConfigInit:
         assert qcfg.exclude_layers == ["lm_head"]
 
 
-class TestParseQuarkConfigDict:
-    @pytest.fixture
-    def qcfg(self):
-        return QuantizationConfig(config=None)
-
-    def test_per_channel_fp8(self, qcfg):
-        result = qcfg.parse_quark_config_dict(
-            {
-                "weight": {"qscheme": "per_channel", "dtype": "fp8_e4m3"},
-                "input_tensors": {"is_dynamic": True},
-            }
-        )
-        assert result["quant_type"] == QuantType.per_Token
-        assert result["quant_dtype"] == FP8
-        assert result["is_dynamic"] is True
-        assert result["quant_method"] == "quark"
-
-    def test_per_group_fp4(self, qcfg):
-        result = qcfg.parse_quark_config_dict(
-            {
-                "weight": {"qscheme": "per_group", "dtype": "fp4_e2m1"},
-                "input_tensors": {"is_dynamic": False},
-            }
-        )
-        assert result["quant_type"] == QuantType.per_1x32
-        assert result["quant_dtype"] == FP4X2
-        assert result["is_dynamic"] is False
-
-    def test_no_input_tensors_defaults_dynamic(self, qcfg):
-        """When input_tensors is absent/None, is_dynamic keeps its True default."""
-        result = qcfg.parse_quark_config_dict(
-            {
-                "weight": {"qscheme": "per_tensor", "dtype": "int8"},
-                "input_tensors": None,
-            }
-        )
-        assert result["quant_type"] == QuantType.per_Tensor
-        assert result["is_dynamic"] is True
+# =========================================================================
+# Tests — get_layer_quant_spec resolution
+# =========================================================================
 
 
-class TestShouldIgnoreLayerQuant:
-    def _make(self, exclude_layers):
+class TestGetLayerQuantSpec:
+    def test_falls_back_to_global(self):
         qcfg = QuantizationConfig(config=None)
-        qcfg.exclude_layers = exclude_layers
-        return qcfg
-
-    def test_empty_exclude(self):
-        assert self._make([]).should_ignore_layer_quant("any_layer") is False
-
-    def test_none_layer_name(self):
-        assert self._make(["lm_head"]).should_ignore_layer_quant(None) is False
-
-    def test_exact_match(self):
-        assert self._make(["lm_head"]).should_ignore_layer_quant("lm_head") is True
-
-    def test_regex_match(self):
-        qcfg = self._make(["re:model\\.layers\\..*shared_expert.*"])
-        assert (
-            qcfg.should_ignore_layer_quant("model.layers.3.shared_expert.gate_proj")
-            is True
+        qcfg.global_quant_config = LayerQuantConfig(
+            quant_type=QuantType.per_Token, quant_dtype=FP8
         )
+        result = qcfg.get_layer_quant_spec("model.layers.0.self_attn.q_proj")
+        assert result.quant_type == QuantType.per_Token
+        assert result.quant_dtype == FP8
 
-    def test_no_match(self):
-        assert (
-            self._make(["lm_head"]).should_ignore_layer_quant("self_attn.q_proj")
-            is False
+    def test_layer_specific_overrides_global(self):
+        qcfg = QuantizationConfig(config=None)
+        qcfg.global_quant_config = LayerQuantConfig(quant_dtype=FP8)
+        mlp_cfg = LayerQuantConfig(quant_type=QuantType.per_1x32, quant_dtype=FP4X2)
+        qcfg.layer_quant_config = {"*.mlp.*": mlp_cfg}
+
+        result = qcfg.get_layer_quant_spec("model.layers.0.mlp.gate_proj")
+        assert result.quant_dtype == FP4X2
+        assert result.quant_type == QuantType.per_1x32
+
+    def test_excluded_layer_returns_unquantized(self):
+        qcfg = QuantizationConfig(config=None)
+        qcfg.torch_dtype = BF16
+        qcfg.global_quant_config = LayerQuantConfig(
+            quant_type=QuantType.per_Token, quant_dtype=FP8
         )
+        qcfg.exclude_layers = ["lm_head"]
+
+        result = qcfg.get_layer_quant_spec("lm_head")
+        assert result.quant_type == QuantType.No
+        assert result.quant_dtype == BF16
 
 
-class TestIsEqualOrRegexMatch:
-    @pytest.fixture
-    def qcfg(self):
-        return QuantizationConfig(config=None)
-
-    def test_exact(self, qcfg):
-        assert qcfg.is_equal_or_regex_match("lm_head", "lm_head") is True
-        assert qcfg.is_equal_or_regex_match("lm_head", "other") is False
-
-    def test_regex(self, qcfg):
-        assert (
-            qcfg.is_equal_or_regex_match(
-                "model.layers.5.self_attn.q_proj",
-                "re:model\\.layers\\..*self_attn.*",
-            )
-            is True
-        )
-        assert (
-            qcfg.is_equal_or_regex_match(
-                "model.layers.5.mlp.gate_proj",
-                "re:model\\.layers\\..*self_attn.*",
-            )
-            is False
-        )
-
-    def test_contains_mode(self, qcfg):
-        assert (
-            qcfg.is_equal_or_regex_match(
-                "self_attn",
-                "model.layers.0.self_attn.q_a_proj",
-                check_contains=True,
-            )
-            is True
-        )
-        assert (
-            qcfg.is_equal_or_regex_match("mlp", "self_attn.q_proj", check_contains=True)
-            is False
-        )
+# =========================================================================
+# Tests — backward-compat get_layer_quant_config (dict API)
+# =========================================================================
 
 
 class TestGetLayerQuantConfig:
@@ -349,6 +442,81 @@ class TestGetLayerQuantConfig:
         result = qcfg.get_layer_quant_config("lm_head")
         assert result["quant_type"] == QuantType.No
         assert result["quant_dtype"] == BF16
+
+
+# =========================================================================
+# Tests — Exclude layer matching
+# =========================================================================
+
+
+class TestExcludeMatching:
+    def _make(self, exclude_layers):
+        qcfg = QuantizationConfig(config=None)
+        qcfg.exclude_layers = exclude_layers
+        return qcfg
+
+    def test_empty_exclude(self):
+        qcfg = self._make([])
+        assert not qcfg._is_excluded("any_layer")
+
+    def test_none_layer_name(self):
+        qcfg = self._make(["lm_head"])
+        assert not qcfg._is_excluded(None)
+
+    def test_exact_match(self):
+        qcfg = self._make(["lm_head"])
+        assert qcfg._is_excluded("lm_head")
+
+    def test_regex_match(self):
+        qcfg = self._make(["re:model\\.layers\\..*shared_expert.*"])
+        assert qcfg._is_excluded("model.layers.3.shared_expert.gate_proj")
+
+    def test_no_match(self):
+        qcfg = self._make(["lm_head"])
+        assert not qcfg._is_excluded("self_attn.q_proj")
+
+
+class TestMatchesExclude:
+    def test_exact(self):
+        assert QuantizationConfig._matches_exclude("lm_head", "lm_head") is True
+        assert QuantizationConfig._matches_exclude("lm_head", "other") is False
+
+    def test_regex(self):
+        assert (
+            QuantizationConfig._matches_exclude(
+                "model.layers.5.self_attn.q_proj",
+                "re:model\\.layers\\..*self_attn.*",
+            )
+            is True
+        )
+        assert (
+            QuantizationConfig._matches_exclude(
+                "model.layers.5.mlp.gate_proj",
+                "re:model\\.layers\\..*self_attn.*",
+            )
+            is False
+        )
+
+    def test_contains_mode(self):
+        assert (
+            QuantizationConfig._matches_exclude(
+                "self_attn",
+                "model.layers.0.self_attn.q_a_proj",
+                check_contains=True,
+            )
+            is True
+        )
+        assert (
+            QuantizationConfig._matches_exclude(
+                "mlp", "self_attn.q_proj", check_contains=True
+            )
+            is False
+        )
+
+
+# =========================================================================
+# Tests — remap_layer_name
+# =========================================================================
 
 
 class TestRemapLayerName:
@@ -428,3 +596,26 @@ class TestComputeHash:
             "*.mlp.*": LayerQuantConfig(quant_type=QuantType.per_1x32)
         }
         assert qcfg1.compute_hash() != qcfg2.compute_hash()
+
+
+# =========================================================================
+# Tests — Convenience properties
+# =========================================================================
+
+
+class TestConvenienceProperties:
+    def test_quant_type_property(self):
+        hf = FakeHFConfig(
+            torch_dtype=BF16,
+            quantization_config={
+                "quant_method": "quark",
+                "global_quant_config": {
+                    "weight": {"qscheme": "per_channel", "dtype": "fp8_e4m3"},
+                    "input_tensors": {"is_dynamic": True},
+                },
+            },
+        )
+        qcfg = QuantizationConfig(hf)
+        assert qcfg.quant_type == QuantType.per_Token
+        assert qcfg.quant_dtype == FP8
+        assert qcfg.is_dynamic is True

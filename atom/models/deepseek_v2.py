@@ -1249,9 +1249,9 @@ class DeepseekV2MLAAttention(nn.Module):
         q_a_proj_name = (
             "fused_qkv_a_proj" if self.q_lora_rank is not None else "q_a_proj"
         )
-        layer_quant_dtype = quant_config.get_layer_quant_config(
+        layer_quant_dtype = quant_config.get_layer_quant_spec(
             f"{prefix}.{q_a_proj_name}"
-        )["quant_dtype"]
+        ).quant_dtype
         if layer_quant_dtype == dtypes.fp4x2:
             if not use_triton_gemm():
                 source_quant_dtype = None
@@ -1553,7 +1553,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.quant_dtype = (
             None
             if quant_config is None
-            else quant_config.global_quant_config["quant_dtype"]
+            else quant_config.get_layer_quant_spec(prefix).quant_dtype
         )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION

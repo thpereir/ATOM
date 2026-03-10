@@ -9,6 +9,7 @@ from torch.overrides import (
     handle_torch_function,
 )
 from atom.config import QuantizationConfig, LayerQuantConfig
+from atom.quant_spec import LayerQuantSpec
 from torch import nn
 from aiter import (
     rmsnorm2d_fwd,
@@ -177,6 +178,7 @@ class RMSNorm(nn.Module):
         fused_allreduce: bool = False,
         fused_quant: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -187,13 +189,13 @@ class RMSNorm(nn.Module):
         self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
 
-        layer_quant_config = (
-            LayerQuantConfig()
+        layer_quant_spec = (
+            LayerQuantSpec()
             if quant_config is None
-            else quant_config.global_quant_config
+            else quant_config.get_layer_quant_spec(prefix)
         )
-        quant_type = layer_quant_config["quant_type"]
-        params_dtype = layer_quant_config["quant_dtype"]
+        quant_type = layer_quant_spec.quant_type
+        params_dtype = layer_quant_spec.quant_dtype
         self.quant_type = quant_type
         self.params_dtype = params_dtype
 

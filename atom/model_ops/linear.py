@@ -22,6 +22,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from atom.config import QuantizationConfig, get_current_atom_config, LayerQuantConfig
+from atom.quant_spec import LayerQuantSpec
 from atom.model_ops.utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requantize_with_max_scale,
@@ -208,15 +209,15 @@ class LinearBase(nn.Module):
         prefix: str = "",
     ):
         self.prefix = prefix
-        layer_quant_config = (
-            quant_config.get_layer_quant_config(prefix)
+        layer_quant_spec = (
+            quant_config.get_layer_quant_spec(prefix)
             if quant_config is not None
-            else LayerQuantConfig()
+            else LayerQuantSpec()
         )
-        quant_type = layer_quant_config["quant_type"]
-        params_dtype = layer_quant_config["quant_dtype"]
+        quant_type = layer_quant_spec.quant_type
+        params_dtype = layer_quant_spec.quant_dtype
         self.source_quant_dtype = source_quant_dtype
-        self.layer_quant_config = layer_quant_config
+        self.layer_quant_spec = layer_quant_spec
         super().__init__()
         self.reduce_results = reduce_results
         self.input_size = input_size
@@ -270,7 +271,7 @@ class LinearBase(nn.Module):
                     torch.empty(len(self.output_partition_sizes), 1, dtype=dtypes.fp32),
                     requires_grad=False,
                 )
-                if not layer_quant_config["is_dynamic"]:
+                if not layer_quant_spec.is_dynamic:
                     self.input_scale = nn.Parameter(
                         torch.empty(
                             len(self.output_partition_sizes), 1, dtype=dtypes.fp32
